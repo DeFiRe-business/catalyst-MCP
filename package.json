@@ -1,0 +1,10 @@
+{
+  "name": "defire-catalyst-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server and example agents for DeFiRe Catalyst protocol",
+  "scripts": {
+    "build": "cd server && npm run build",
+    "start": "cd server && npm start"
+  }
+}

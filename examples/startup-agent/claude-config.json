@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "defire-catalyst": {
+      "command": "node",
+      "args": ["../../server/dist/index.js"],
+      "env": {
+        "RPC_URL": "https://sepolia.base.org",
+        "WALLET_ADDRESS": ""
+      }
+    }
+  }
+}
