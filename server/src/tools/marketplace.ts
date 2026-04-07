@@ -4,10 +4,9 @@ import {
   getAllProposals,
   getProposalById,
 } from "../data-store.js";
+import { resolveProposalFromChain } from "../blockchain/contracts.js";
 import type {
-  Proposal,
   StartupProposal,
-  TradingProposal,
   EvaluationResult,
 } from "../types.js";
 
@@ -15,18 +14,14 @@ export function registerMarketplaceTools(server: McpServer): void {
   // --- list_proposals ---
   server.tool(
     "list_proposals",
-    "List active proposals on DeFiRe Catalyst marketplace. Returns startups seeking funding and trading agent opportunities.",
+    "List startup proposals on DeFiRe Catalyst marketplace. Returns startups seeking funding.",
     {
-      track: z
-        .enum(["startup", "trading", "all"])
-        .default("all")
-        .describe("Filter by track type"),
       status: z
         .enum(["funding", "active", "completed", "failed", "all"])
         .default("funding")
         .describe("Filter by status"),
       sort_by: z
-        .enum(["newest", "capital_desc", "collateral_ratio_desc", "return_desc"])
+        .enum(["newest", "capital_desc", "collateral_ratio_desc"])
         .default("newest")
         .describe("Sort order"),
       min_capital: z
@@ -39,13 +34,8 @@ export function registerMarketplaceTools(server: McpServer): void {
         .describe("Maximum capital in USD"),
       limit: z.number().default(20).describe("Max results to return"),
     },
-    async ({ track, status, sort_by, min_capital, max_capital, limit }) => {
+    async ({ status, sort_by, min_capital, max_capital, limit }) => {
       let proposals = getAllProposals();
-
-      // Filter by track
-      if (track !== "all") {
-        proposals = proposals.filter((p) => p.track === track);
-      }
 
       // Filter by status
       if (status !== "all") {
@@ -54,22 +44,10 @@ export function registerMarketplaceTools(server: McpServer): void {
 
       // Filter by capital range
       if (min_capital !== undefined) {
-        proposals = proposals.filter((p) => {
-          const cap =
-            p.track === "startup"
-              ? (p as StartupProposal).capital_seeking
-              : (p as TradingProposal).capital_required;
-          return cap >= min_capital;
-        });
+        proposals = proposals.filter((p) => p.capital_seeking >= min_capital);
       }
       if (max_capital !== undefined) {
-        proposals = proposals.filter((p) => {
-          const cap =
-            p.track === "startup"
-              ? (p as StartupProposal).capital_seeking
-              : (p as TradingProposal).capital_required;
-          return cap <= max_capital;
-        });
+        proposals = proposals.filter((p) => p.capital_seeking <= max_capital);
       }
 
       // Sort
@@ -92,12 +70,15 @@ export function registerMarketplaceTools(server: McpServer): void {
   // --- get_proposal_details ---
   server.tool(
     "get_proposal_details",
-    "Get comprehensive details about a specific proposal including pool stats, investor list, and performance data.",
+    "Get comprehensive details about a startup proposal including pool stats, investor list, and performance data.",
     {
       proposal_id: z.string().describe("Proposal ID"),
     },
     async ({ proposal_id }) => {
-      const proposal = getProposalById(proposal_id);
+      // On-chain first, data-store fallback
+      const proposal =
+        (await resolveProposalFromChain(proposal_id)) ??
+        getProposalById(proposal_id);
       if (!proposal) {
         return {
           content: [
@@ -110,17 +91,12 @@ export function registerMarketplaceTools(server: McpServer): void {
         };
       }
 
-      // Augment with computed fields
       const details = {
         ...proposal,
         funding_progress:
-          proposal.track === "startup"
-            ? `${(((proposal as StartupProposal).capital_funded / (proposal as StartupProposal).capital_seeking) * 100).toFixed(1)}%`
-            : `${(((proposal as TradingProposal).capital_funded / (proposal as TradingProposal).capital_required) * 100).toFixed(1)}%`,
+          `${((proposal.capital_funded / proposal.capital_seeking) * 100).toFixed(1)}%`,
         investors_count: Math.floor(Math.random() * 20) + 1,
-        days_remaining: proposal.track === "startup"
-          ? daysUntil(proposal.created_at, (proposal as StartupProposal).commitment_period_days)
-          : daysUntil(proposal.created_at, (proposal as TradingProposal).commitment_period_days),
+        days_remaining: daysUntil(proposal.created_at, proposal.commitment_period_days),
       };
 
       return {
@@ -137,15 +113,18 @@ export function registerMarketplaceTools(server: McpServer): void {
   // --- evaluate_proposal ---
   server.tool(
     "evaluate_proposal",
-    "Get computed metrics to evaluate a proposal's economic viability. Returns estimated fees, projected returns, risk metrics.",
+    "Get computed metrics to evaluate a startup proposal's economic viability. Returns estimated fees, projected returns, risk metrics.",
     {
       proposal_id: z.string().describe("Proposal ID"),
       investment_amount: z
         .number()
-        .describe("How much the agent would invest/commit"),
+        .describe("How much the agent would invest"),
     },
     async ({ proposal_id, investment_amount }) => {
-      const proposal = getProposalById(proposal_id);
+      // On-chain first, data-store fallback
+      const proposal =
+        (await resolveProposalFromChain(proposal_id)) ??
+        getProposalById(proposal_id);
       if (!proposal) {
         return {
           content: [
@@ -192,28 +171,17 @@ export function registerMarketplaceTools(server: McpServer): void {
 // --- Helpers ---
 
 function sortProposals(
-  proposals: Proposal[],
+  proposals: StartupProposal[],
   sortBy: string,
-): Proposal[] {
+): StartupProposal[] {
   return [...proposals].sort((a, b) => {
     switch (sortBy) {
-      case "capital_desc": {
-        const capA =
-          a.track === "startup"
-            ? (a as StartupProposal).capital_seeking
-            : (a as TradingProposal).capital_required;
-        const capB =
-          b.track === "startup"
-            ? (b as StartupProposal).capital_seeking
-            : (b as TradingProposal).capital_required;
-        return capB - capA;
-      }
+      case "capital_desc":
+        return b.capital_seeking - a.capital_seeking;
       case "collateral_ratio_desc":
         return (
           parseFloat(b.collateral_ratio) - parseFloat(a.collateral_ratio)
         );
-      case "return_desc":
-        return 0; // would need historical data
       default: // newest
         return (
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime()

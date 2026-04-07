@@ -5,7 +5,6 @@ import { registerStatusTools } from "./tools/status.js";
 import { registerLeaderboardTools } from "./tools/leaderboard.js";
 import { registerInvestorTools } from "./tools/investor.js";
 import { registerStartupTools } from "./tools/startup.js";
-import { registerTradingTools } from "./tools/trading.js";
 import { registerProtocolStatsResource } from "./resources/protocol-stats.js";
 import { registerFeeScheduleResource } from "./resources/fee-schedule.js";
 
@@ -20,7 +19,6 @@ registerStatusTools(server);
 registerLeaderboardTools(server);
 registerInvestorTools(server);
 registerStartupTools(server);
-registerTradingTools(server);
 
 // Register resources
 registerProtocolStatsResource(server);

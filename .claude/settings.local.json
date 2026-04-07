@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:ethereum-magicians.org)",
+      "WebFetch(domain:eips.ethereum.org)"
+    ]
+  }
+}

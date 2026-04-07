@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { getProvider } from "./contracts.js";
+import { getProvider } from "../config.js";
 
 const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",

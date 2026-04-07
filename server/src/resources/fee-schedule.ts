@@ -10,21 +10,10 @@ const FEE_SCHEDULE = {
     pool2_fee_tier: 10000, // 1% Uniswap fee tier
     early_exit_penalty: "Forfeits token allocation and claim rights; tokens redistributed to remaining investors",
   },
-  trading_track: {
-    description: "Trading agent generates profit; split between investor, agent, and protocol",
-    default_profit_split: {
-      investor_bps: 7000, // 70%
-      agent_bps: 2000, // 20%
-      protocol_bps: 1000, // 10%
-    },
-    min_return_guarantee: "Backed by agent collateral via ERC-8210 AssuranceAccount",
-    early_exit_penalty: "Pro-rata share only; no guaranteed return",
-  },
   collateral: {
     min_ratio_startup_bps: 500, // 5% minimum
-    min_ratio_trading_bps: 1000, // 10% minimum
     lock_mechanism: "ERC-8210 AssuranceAccount",
-    claim_process: "Pro-rata distribution to investors on agent/startup failure",
+    claim_process: "Pro-rata distribution to investors on startup failure",
   },
 };
 

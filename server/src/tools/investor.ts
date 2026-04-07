@@ -5,7 +5,12 @@ import {
   getPositionsForWallet,
   addFunding,
   withdrawFromPosition,
+  fileClaim,
 } from "../data-store.js";
+import {
+  resolveProposalFromChain,
+  getInvestorPosition,
+} from "../blockchain/contracts.js";
 
 const CONNECTED_WALLET = process.env.WALLET_ADDRESS ?? "default";
 
@@ -13,7 +18,7 @@ export function registerInvestorTools(server: McpServer): void {
   // --- fund_proposal ---
   server.tool(
     "fund_proposal",
-    "Fund a startup proposal (add liquidity to Pool 1) or back a trading agent (deposit capital to escrow). Returns transaction hash.",
+    "Fund a startup proposal — deposit liquidity into Pool 1. Returns transaction hash.",
     {
       proposal_id: z.string().describe("Proposal ID"),
       amount: z.number().describe("Amount in USDx to invest"),
@@ -23,7 +28,10 @@ export function registerInvestorTools(server: McpServer): void {
         .describe("Stablecoin to use"),
     },
     async ({ proposal_id, amount, token }) => {
-      const proposal = getProposalById(proposal_id);
+      // On-chain first, data-store fallback
+      const proposal =
+        (await resolveProposalFromChain(proposal_id)) ??
+        getProposalById(proposal_id);
       if (!proposal) {
         return {
           content: [
@@ -91,18 +99,27 @@ export function registerInvestorTools(server: McpServer): void {
   // --- get_my_positions ---
   server.tool(
     "get_my_positions",
-    "Get all investment positions for the connected wallet across both tracks.",
-    {
-      track: z
-        .enum(["startup", "trading", "all"])
-        .default("all")
-        .describe("Filter by track"),
-    },
-    async ({ track }) => {
-      let positions = getPositionsForWallet(CONNECTED_WALLET);
+    "Get all investment positions for the connected wallet.",
+    {},
+    async () => {
+      const positions = getPositionsForWallet(CONNECTED_WALLET);
 
-      if (track !== "all") {
-        positions = positions.filter((p) => p.track === track);
+      // Try to enrich each position with on-chain data
+      for (const pos of positions) {
+        const match = pos.proposal_id.match(/^prop_(\d+)$/);
+        if (!match) continue;
+        const jobId = parseInt(match[1], 10);
+        const chainPos = await getInvestorPosition(jobId, CONNECTED_WALLET);
+        if (chainPos) {
+          pos.amount_invested = Number(chainPos.amountInvested) / 1e6;
+          pos.current_value = Number(chainPos.currentValue) / 1e6;
+          pos.tokens_allocated = Number(chainPos.tokensAllocated) / 1e6;
+          pos.pnl = pos.current_value - pos.amount_invested;
+          pos.pnl_pct =
+            pos.amount_invested > 0
+              ? `${((pos.pnl / pos.amount_invested) * 100).toFixed(2)}%`
+              : "0%";
+        }
       }
 
       const totalInvested = positions.reduce(
@@ -142,7 +159,7 @@ export function registerInvestorTools(server: McpServer): void {
   // --- withdraw_liquidity ---
   server.tool(
     "withdraw_liquidity",
-    "Withdraw liquidity from a position. WARNING: If before commitment deadline, investor loses token allocation and claim rights. Tokens are redistributed to remaining investors.",
+    "Withdraw liquidity from a startup position. WARNING: If before commitment deadline, investor loses token allocation and claim rights. Tokens are redistributed to remaining investors.",
     {
       proposal_id: z.string().describe("Proposal ID"),
       amount: z
@@ -212,6 +229,59 @@ export function registerInvestorTools(server: McpServer): void {
               null,
               2,
             ),
+          },
+        ],
+      };
+    },
+  );
+
+  // --- file_claim ---
+  server.tool(
+    "file_claim",
+    "File a claim against collateral of a failed startup via ERC-8210 AssuranceAccount.",
+    {
+      proposal_id: z.string().describe("Proposal ID"),
+      claim_amount: z
+        .number()
+        .describe(
+          "Amount to claim. Max = investor's pro-rata share of collateral.",
+        ),
+    },
+    async ({ proposal_id, claim_amount }) => {
+      if (claim_amount <= 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ error: "claim_amount must be positive" }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const result = fileClaim(proposal_id, claim_amount, CONNECTED_WALLET);
+
+      if (!result.success) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: result.message,
+                proposal_id,
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
           },
         ],
       };

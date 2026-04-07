@@ -5,14 +5,10 @@
 import type {
   Proposal,
   StartupProposal,
-  TradingProposal,
   InvestorPosition,
   ProtocolStats,
   LeaderboardEntry,
   StartupStatus,
-  AgentStatus,
-  PnlSnapshot,
-  OpenPosition,
   ClaimResult,
 } from "./types.js";
 
@@ -75,63 +71,6 @@ const startupProposals: StartupProposal[] = [
   },
 ];
 
-const tradingProposals: TradingProposal[] = [
-  {
-    id: "prop_002",
-    track: "trading",
-    name: "AlphaVault v2",
-    description: "Mean-reversion strategy on ETH/USDC",
-    status: "active",
-    capital_required: 50000,
-    capital_funded: 50000,
-    collateral: 5000,
-    collateral_ratio: "10%",
-    commitment_period_days: 30,
-    min_return_bps: 200,
-    profit_split: { investor: 70, agent: 20, protocol: 10 },
-    agent_tier: 3,
-    agent_address: "0x7a3f000000000000000000000000000000e92b00",
-    owner: "0xbbbb000000000000000000000000000000000001",
-    created_at: "2026-03-28T00:00:00Z",
-  },
-  {
-    id: "prop_004",
-    track: "trading",
-    name: "MomentumBot",
-    description: "Trend-following strategy on WBTC/USDC with volatility filters",
-    status: "funding",
-    capital_required: 100000,
-    capital_funded: 35000,
-    collateral: 10000,
-    collateral_ratio: "10%",
-    commitment_period_days: 60,
-    min_return_bps: 300,
-    profit_split: { investor: 65, agent: 25, protocol: 10 },
-    agent_tier: 2,
-    agent_address: "0xcccc000000000000000000000000000000000001",
-    owner: "0xbbbb000000000000000000000000000000000002",
-    created_at: "2026-04-02T00:00:00Z",
-  },
-  {
-    id: "prop_006",
-    track: "trading",
-    name: "ArbSeeker",
-    description: "Cross-pool arbitrage on correlated pairs",
-    status: "funding",
-    capital_required: 75000,
-    capital_funded: 60000,
-    collateral: 7500,
-    collateral_ratio: "10%",
-    commitment_period_days: 14,
-    min_return_bps: 150,
-    profit_split: { investor: 75, agent: 15, protocol: 10 },
-    agent_tier: 4,
-    agent_address: "0xdddd000000000000000000000000000000000001",
-    owner: "0xbbbb000000000000000000000000000000000003",
-    created_at: "2026-04-04T00:00:00Z",
-  },
-];
-
 // --- Seed investor positions ---
 
 const investorPositions: Map<string, InvestorPosition[]> = new Map([
@@ -140,7 +79,6 @@ const investorPositions: Map<string, InvestorPosition[]> = new Map([
     [
       {
         proposal_id: "prop_001",
-        track: "startup",
         proposal_name: "Neuron Analytics",
         amount_invested: 10000,
         current_value: 10250,
@@ -151,37 +89,69 @@ const investorPositions: Map<string, InvestorPosition[]> = new Map([
         status: "funding",
       },
       {
-        proposal_id: "prop_002",
-        track: "trading",
-        proposal_name: "AlphaVault v2",
+        proposal_id: "prop_003",
+        proposal_name: "DeFi Shield",
         amount_invested: 15000,
         current_value: 15450,
         pnl: 450,
         pnl_pct: "+3.0%",
-        tokens_allocated: 0,
-        commitment_deadline: "2026-04-27T00:00:00Z",
+        tokens_allocated: 3000,
+        commitment_deadline: "2027-03-15T00:00:00Z",
         status: "active",
       },
     ],
   ],
 ]);
 
-// --- Leaderboard seed ---
+// --- Leaderboard seed (startup-focused) ---
 
 const leaderboard: LeaderboardEntry[] = [
-  { rank: 1, agent_id: "prop_006", name: "ArbSeeker", return_pct: "18.4%", sharpe_ratio: 2.8, capital_managed: 75000, completed_cycles: 12, tier: 4 },
-  { rank: 2, agent_id: "prop_002", name: "AlphaVault v2", return_pct: "12.1%", sharpe_ratio: 2.1, capital_managed: 50000, completed_cycles: 8, tier: 3 },
-  { rank: 3, agent_id: "prop_004", name: "MomentumBot", return_pct: "9.7%", sharpe_ratio: 1.6, capital_managed: 100000, completed_cycles: 3, tier: 2 },
+  { rank: 1, startup_id: "prop_003", name: "DeFi Shield", token_appreciation: "42.5%", pool2_volume: 185000, investor_count: 18, days_since_launch: 22 },
+  { rank: 2, startup_id: "prop_001", name: "Neuron Analytics", token_appreciation: "15.3%", pool2_volume: 62000, investor_count: 9, days_since_launch: 5 },
+  { rank: 3, startup_id: "prop_005", name: "YieldBridge", token_appreciation: "8.1%", pool2_volume: 24000, investor_count: 4, days_since_launch: 3 },
 ];
+
+// --- Fee tracking ---
+
+const startupFees: Map<string, number> = new Map([
+  ["prop_001", 1250],
+  ["prop_003", 8400],
+  ["prop_005", 320],
+]);
+
+// --- Helpers ---
+
+function makeTxHash(): string {
+  return (
+    "0x" +
+    Array.from({ length: 64 }, () =>
+      Math.floor(Math.random() * 16).toString(16),
+    ).join("")
+  );
+}
+
+function makeAddress(): string {
+  return (
+    "0x" +
+    Array.from({ length: 40 }, () =>
+      Math.floor(Math.random() * 16).toString(16),
+    ).join("")
+  );
+}
+
+function daysRemaining(createdAt: string, periodDays: number): number {
+  const deadline = new Date(createdAt).getTime() + periodDays * 86400000;
+  return Math.max(0, Math.ceil((deadline - Date.now()) / 86400000));
+}
 
 // --- Public API ---
 
 export function getAllProposals(): Proposal[] {
-  return [...startupProposals, ...tradingProposals];
+  return [...startupProposals];
 }
 
 export function getProposalById(id: string): Proposal | undefined {
-  return getAllProposals().find((p) => p.id === id);
+  return startupProposals.find((p) => p.id === id);
 }
 
 export function getPositionsForWallet(
@@ -198,16 +168,11 @@ export function addFunding(
   const proposal = getProposalById(proposalId);
   if (!proposal) return { success: false, tx_hash: "" };
 
-  if (proposal.track === "startup") {
-    (proposal as StartupProposal).capital_funded += amount;
-  } else {
-    (proposal as TradingProposal).capital_funded += amount;
-  }
+  proposal.capital_funded += amount;
 
   const positions = investorPositions.get(wallet) ?? [];
   positions.push({
     proposal_id: proposalId,
-    track: proposal.track,
     proposal_name: proposal.name,
     amount_invested: amount,
     current_value: amount,
@@ -215,22 +180,13 @@ export function addFunding(
     pnl_pct: "0%",
     tokens_allocated: 0,
     commitment_deadline: new Date(
-      Date.now() +
-        (proposal.track === "startup"
-          ? (proposal as StartupProposal).commitment_period_days
-          : (proposal as TradingProposal).commitment_period_days) *
-          86400000,
+      Date.now() + proposal.commitment_period_days * 86400000,
     ).toISOString(),
     status: proposal.status,
   });
   investorPositions.set(wallet, positions);
 
-  const txHash =
-    "0x" +
-    Array.from({ length: 64 }, () =>
-      Math.floor(Math.random() * 16).toString(16),
-    ).join("");
-  return { success: true, tx_hash: txHash };
+  return { success: true, tx_hash: makeTxHash() };
 }
 
 export function withdrawFromPosition(
@@ -256,39 +212,25 @@ export function withdrawFromPosition(
   pos.current_value -= withdrawAmount;
   pos.amount_invested -= withdrawAmount;
 
-  const txHash =
-    "0x" +
-    Array.from({ length: 64 }, () =>
-      Math.floor(Math.random() * 16).toString(16),
-    ).join("");
-
   return {
     success: true,
     withdrawn: withdrawAmount,
     early_exit: earlyExit,
     penalty_applied: earlyExit,
-    tx_hash: txHash,
+    tx_hash: makeTxHash(),
   };
 }
 
 export function getProtocolStats(): ProtocolStats {
-  const proposals = getAllProposals();
-  const tvl = proposals.reduce((sum, p) => {
-    const funded = p.track === "startup"
-      ? (p as StartupProposal).capital_funded
-      : (p as TradingProposal).capital_funded;
-    return sum + funded;
-  }, 0);
+  const tvl = startupProposals.reduce((sum, p) => sum + p.capital_funded, 0);
 
   return {
-    total_tvl: tvl,
-    active_proposals: proposals.filter((p) => p.status === "active" || p.status === "funding").length,
-    total_proposals: proposals.length,
-    fees_distributed: 34250,
-    avg_investor_return: "8.5%",
-    total_agents: tradingProposals.length,
-    total_startups: startupProposals.length,
-    total_investors: 47,
+    total_tvl_pool1: tvl,
+    total_pool2_volume: leaderboard.reduce((sum, e) => sum + e.pool2_volume, 0),
+    startups_launched: startupProposals.length,
+    tokens_protocol_holds: startupProposals.filter((p) => p.status === "active" || p.status === "completed").length,
+    total_fees_distributed: 34250,
+    avg_token_appreciation: "21.9%",
   };
 }
 
@@ -299,61 +241,22 @@ export function getLeaderboardData(
 ): LeaderboardEntry[] {
   const sorted = [...leaderboard].sort((a, b) => {
     switch (sortBy) {
-      case "sharpe":
-        return b.sharpe_ratio - a.sharpe_ratio;
-      case "capital":
-        return b.capital_managed - a.capital_managed;
-      case "cycles":
-        return b.completed_cycles - a.completed_cycles;
-      default:
-        return parseFloat(b.return_pct) - parseFloat(a.return_pct);
+      case "pool2_volume":
+        return b.pool2_volume - a.pool2_volume;
+      case "investor_count":
+        return b.investor_count - a.investor_count;
+      case "days_since_launch":
+        return a.days_since_launch - b.days_since_launch;
+      default: // token_appreciation
+        return parseFloat(b.token_appreciation) - parseFloat(a.token_appreciation);
     }
   });
   return sorted.slice(0, limit);
 }
 
-// ============================================================
-// Phase 2: Startup + Trading Agent data operations
-// ============================================================
+// --- Startup operations ---
 
 let nextProposalId = 7;
-
-const pnlSnapshots: Map<string, PnlSnapshot[]> = new Map();
-const startupFees: Map<string, number> = new Map([
-  ["prop_001", 1250],
-  ["prop_003", 8400],
-  ["prop_005", 320],
-]);
-const agentBalances: Map<string, number> = new Map([
-  ["prop_002", 51500],
-  ["prop_004", 35000],
-  ["prop_006", 62400],
-]);
-
-function makeTxHash(): string {
-  return (
-    "0x" +
-    Array.from({ length: 64 }, () =>
-      Math.floor(Math.random() * 16).toString(16),
-    ).join("")
-  );
-}
-
-function makeAddress(): string {
-  return (
-    "0x" +
-    Array.from({ length: 40 }, () =>
-      Math.floor(Math.random() * 16).toString(16),
-    ).join("")
-  );
-}
-
-function daysRemaining(createdAt: string, periodDays: number): number {
-  const deadline = new Date(createdAt).getTime() + periodDays * 86400000;
-  return Math.max(0, Math.ceil((deadline - Date.now()) / 86400000));
-}
-
-// --- Startup operations ---
 
 export function registerStartup(params: {
   name: string;
@@ -449,111 +352,6 @@ export function buybackToken(
   };
 }
 
-// --- Trading agent operations ---
-
-export function registerTradingAgentData(params: {
-  name: string;
-  strategy_description: string;
-  capital_required: number;
-  collateral_amount: number;
-  commitment_period_days: number;
-  min_return_bps: number;
-  profit_split_investor_bps: number;
-  owner: string;
-}): { success: boolean; agent_id: string; tx_hash: string } {
-  const id = `prop_${String(nextProposalId++).padStart(3, "0")}`;
-  const agentBps = 10000 - params.profit_split_investor_bps - 1000; // protocol gets 10%
-  const ratio = ((params.collateral_amount / params.capital_required) * 100).toFixed(2) + "%";
-
-  const proposal: TradingProposal = {
-    id,
-    track: "trading",
-    name: params.name,
-    description: params.strategy_description,
-    status: "funding",
-    capital_required: params.capital_required,
-    capital_funded: 0,
-    collateral: params.collateral_amount,
-    collateral_ratio: ratio,
-    commitment_period_days: params.commitment_period_days,
-    min_return_bps: params.min_return_bps,
-    profit_split: {
-      investor: params.profit_split_investor_bps / 100,
-      agent: agentBps / 100,
-      protocol: 10,
-    },
-    agent_tier: 1,
-    agent_address: params.owner,
-    owner: params.owner,
-    created_at: new Date().toISOString(),
-  };
-
-  tradingProposals.push(proposal);
-  agentBalances.set(id, 0);
-
-  return { success: true, agent_id: id, tx_hash: makeTxHash() };
-}
-
-export function getAgentStatus(agentId: string): AgentStatus | null {
-  const proposal = tradingProposals.find((p) => p.id === agentId);
-  if (!proposal) return null;
-
-  const balance = agentBalances.get(agentId) ?? proposal.capital_funded;
-  const pnl = balance - proposal.capital_funded;
-  const snapshots = pnlSnapshots.get(agentId);
-  const lastReport = snapshots && snapshots.length > 0
-    ? snapshots[snapshots.length - 1].timestamp
-    : null;
-
-  return {
-    agent_id: proposal.id,
-    name: proposal.name,
-    status: proposal.status,
-    capital_required: proposal.capital_required,
-    capital_funded: proposal.capital_funded,
-    collateral: proposal.collateral,
-    current_balance: balance,
-    pnl,
-    pnl_pct: proposal.capital_funded > 0
-      ? (pnl / proposal.capital_funded * 100).toFixed(2) + "%"
-      : "0%",
-    fees_received: Math.round(balance * 0.003 * 100) / 100,
-    tier: proposal.agent_tier,
-    commitment_period_days: proposal.commitment_period_days,
-    days_remaining: daysRemaining(proposal.created_at, proposal.commitment_period_days),
-    last_pnl_report: lastReport,
-    created_at: proposal.created_at,
-  };
-}
-
-export function recordPnlSnapshot(
-  agentId: string,
-  currentBalance: number,
-  openPositions: OpenPosition[],
-): { success: boolean; snapshot_id: string; timestamp: string } {
-  const proposal = tradingProposals.find((p) => p.id === agentId);
-  if (!proposal) return { success: false, snapshot_id: "", timestamp: "" };
-
-  agentBalances.set(agentId, currentBalance);
-
-  const snapshot: PnlSnapshot = {
-    agent_id: agentId,
-    current_balance: currentBalance,
-    open_positions: openPositions,
-    timestamp: new Date().toISOString(),
-  };
-
-  const existing = pnlSnapshots.get(agentId) ?? [];
-  existing.push(snapshot);
-  pnlSnapshots.set(agentId, existing);
-
-  return {
-    success: true,
-    snapshot_id: `snap_${agentId}_${existing.length}`,
-    timestamp: snapshot.timestamp,
-  };
-}
-
 // --- Claim operations ---
 
 export function fileClaim(
@@ -575,9 +373,7 @@ export function fileClaim(
     return { success: false, proposal_id: proposalId, claim_amount: 0, tx_hash: "", message: "No position found for this proposal" };
   }
 
-  const maxClaim = proposal.collateral * (pos.amount_invested / (proposal.track === "startup"
-    ? (proposal as StartupProposal).capital_funded
-    : (proposal as TradingProposal).capital_funded));
+  const maxClaim = proposal.collateral * (pos.amount_invested / proposal.capital_funded);
   const actual = Math.min(claimAmount, maxClaim);
 
   return {
