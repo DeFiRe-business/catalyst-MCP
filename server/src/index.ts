@@ -5,25 +5,26 @@ import { registerStatusTools } from "./tools/status.js";
 import { registerLeaderboardTools } from "./tools/leaderboard.js";
 import { registerInvestorTools } from "./tools/investor.js";
 import { registerStartupTools } from "./tools/startup.js";
-import { registerProtocolStatsResource } from "./resources/protocol-stats.js";
-import { registerFeeScheduleResource } from "./resources/fee-schedule.js";
+import { registerOracleTools } from "./tools/oracle.js";
+import { registerAdminTools } from "./tools/admin.js";
 
 const server = new McpServer({
   name: "defire-catalyst",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
-// Register all tools
+// Read tools
 registerMarketplaceTools(server);
 registerStatusTools(server);
 registerLeaderboardTools(server);
+
+// Mixed read/write tools
 registerInvestorTools(server);
 registerStartupTools(server);
 
-// Register resources
-registerProtocolStatsResource(server);
-registerFeeScheduleResource(server);
+// Write-only tool groups (require role-specific signing keys)
+registerOracleTools(server);
+registerAdminTools(server);
 
-// Start with stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

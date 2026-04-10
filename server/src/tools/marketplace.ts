@@ -1,200 +1,203 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { ethers } from "ethers";
 import {
-  getAllProposals,
-  getProposalById,
-} from "../data-store.js";
-import { resolveProposalFromChain } from "../blockchain/contracts.js";
-import type {
-  StartupProposal,
-  EvaluationResult,
-} from "../types.js";
+  getRegistry,
+  getHook,
+  getVault,
+  getAdoptionScorer,
+  decodeStartup,
+  decodeScore,
+  serializeBigints,
+  statusName,
+  verdictName,
+  type StartupInfo,
+} from "../blockchain/contracts.js";
+
+const MAX_STARTUPS = Number(process.env.MAX_STARTUPS ?? 100);
+
+interface ListedStartup {
+  startup_id: number;
+  owner: string;
+  name: string;
+  description: string;
+  status: string;
+  token: string;
+  pool1: string;
+  pool2: string;
+  collateral: string;
+  commitment_deadline: string;
+  total_funding: string;
+  min_token_price: string;
+}
+
+function toListed(id: number, info: StartupInfo): ListedStartup {
+  return {
+    startup_id: id,
+    owner: info.owner,
+    name: info.name,
+    description: info.description,
+    status: statusName(info.status),
+    token: info.token,
+    pool1: info.pool1,
+    pool2: info.pool2,
+    collateral: info.collateral.toString(),
+    commitment_deadline: info.commitmentDeadline.toString(),
+    total_funding: info.totalFunding.toString(),
+    min_token_price: info.minTokenPrice.toString(),
+  };
+}
 
 export function registerMarketplaceTools(server: McpServer): void {
-  // --- list_proposals ---
+  // -------------------------------------------------------------------------
+  // list_startups
+  // -------------------------------------------------------------------------
   server.tool(
-    "list_proposals",
-    "List startup proposals on DeFiRe Catalyst marketplace. Returns startups seeking funding.",
+    "list_startups",
+    `List startups registered on Catalyst. Iterates the on-chain registry from id 1 upward (capped at MAX_STARTUPS, default 100). Stops at the first all-zero entry, then filters zero-owner records.`,
     {
       status: z
         .enum(["funding", "active", "completed", "failed", "all"])
-        .default("funding")
+        .default("all")
         .describe("Filter by status"),
-      sort_by: z
-        .enum(["newest", "capital_desc", "collateral_ratio_desc"])
-        .default("newest")
-        .describe("Sort order"),
-      min_capital: z
-        .number()
-        .optional()
-        .describe("Minimum capital in USD"),
-      max_capital: z
-        .number()
-        .optional()
-        .describe("Maximum capital in USD"),
-      limit: z.number().default(20).describe("Max results to return"),
+      limit: z.number().int().positive().default(50).describe("Max results to return"),
     },
-    async ({ status, sort_by, min_capital, max_capital, limit }) => {
-      let proposals = getAllProposals();
+    async ({ status, limit }) => {
+      try {
+        const registry = getRegistry();
+        const out: ListedStartup[] = [];
 
-      // Filter by status
-      if (status !== "all") {
-        proposals = proposals.filter((p) => p.status === status);
-      }
+        for (let id = 1; id <= MAX_STARTUPS; id++) {
+          const raw = await registry.getStartup(id);
+          const info = decodeStartup(raw);
+          if (info.owner === ethers.ZeroAddress) {
+            // First all-zero record marks the end of the registered range.
+            break;
+          }
+          if (status !== "all" && statusName(info.status) !== status) {
+            continue;
+          }
+          out.push(toListed(id, info));
+          if (out.length >= limit) break;
+        }
 
-      // Filter by capital range
-      if (min_capital !== undefined) {
-        proposals = proposals.filter((p) => p.capital_seeking >= min_capital);
-      }
-      if (max_capital !== undefined) {
-        proposals = proposals.filter((p) => p.capital_seeking <= max_capital);
-      }
-
-      // Sort
-      proposals = sortProposals(proposals, sort_by);
-
-      // Limit
-      proposals = proposals.slice(0, limit);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({ proposals }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // --- get_proposal_details ---
-  server.tool(
-    "get_proposal_details",
-    "Get comprehensive details about a startup proposal including pool stats, investor list, and performance data.",
-    {
-      proposal_id: z.string().describe("Proposal ID"),
-    },
-    async ({ proposal_id }) => {
-      // On-chain first, data-store fallback
-      const proposal =
-        (await resolveProposalFromChain(proposal_id)) ??
-        getProposalById(proposal_id);
-      if (!proposal) {
         return {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ error: "Proposal not found", proposal_id }),
+              text: JSON.stringify({ count: out.length, startups: out }, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
+              }),
             },
           ],
           isError: true,
         };
       }
-
-      const details = {
-        ...proposal,
-        funding_progress:
-          `${((proposal.capital_funded / proposal.capital_seeking) * 100).toFixed(1)}%`,
-        investors_count: Math.floor(Math.random() * 20) + 1,
-        days_remaining: daysUntil(proposal.created_at, proposal.commitment_period_days),
-      };
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(details, null, 2),
-          },
-        ],
-      };
     },
   );
 
-  // --- evaluate_proposal ---
+  // -------------------------------------------------------------------------
+  // get_startup_details
+  // -------------------------------------------------------------------------
   server.tool(
-    "evaluate_proposal",
-    "Get computed metrics to evaluate a startup proposal's economic viability. Returns estimated fees, projected returns, risk metrics.",
+    "get_startup_details",
+    `Detailed view of a single startup. Returns the full registry struct plus committed collateral (from CollateralVault), investor count (from CatalystHook), current TOKEN price in stables (from CatalystHook.getTokenPriceInStables), and the latest adoption score (from CatalystAdoptionScorer.getScore).`,
     {
-      proposal_id: z.string().describe("Proposal ID"),
-      investment_amount: z
-        .number()
-        .describe("How much the agent would invest"),
+      startup_id: z.number().int().positive().describe("Startup id (uint256)"),
     },
-    async ({ proposal_id, investment_amount }) => {
-      // On-chain first, data-store fallback
-      const proposal =
-        (await resolveProposalFromChain(proposal_id)) ??
-        getProposalById(proposal_id);
-      if (!proposal) {
+    async ({ startup_id }) => {
+      try {
+        const registry = getRegistry();
+        const hook = getHook();
+        const vault = getVault();
+        const scorer = getAdoptionScorer();
+
+        const raw = await registry.getStartup(startup_id);
+        const info = decodeStartup(raw);
+        if (info.owner === ethers.ZeroAddress) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Startup not found", startup_id }),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const [investorCountRaw, claimedRaw, tokenPriceRaw, scoreRaw] =
+          await Promise.allSettled([
+            hook.getInvestorCount(startup_id),
+            vault.claimedFromJob(startup_id),
+            hook.getTokenPriceInStables(startup_id),
+            scorer.getScore(startup_id),
+          ]);
+
+        const investor_count =
+          investorCountRaw.status === "fulfilled" ? Number(investorCountRaw.value) : null;
+
+        const claimed: bigint =
+          claimedRaw.status === "fulfilled" ? BigInt(claimedRaw.value) : 0n;
+        const committed_collateral = (info.collateral - claimed).toString();
+
+        const token_price_in_stables =
+          tokenPriceRaw.status === "fulfilled" ? BigInt(tokenPriceRaw.value).toString() : null;
+
+        let adoption_score = null;
+        if (scoreRaw.status === "fulfilled") {
+          const s = decodeScore(scoreRaw.value);
+          if (s.timestamp > 0n) {
+            adoption_score = {
+              verdict: verdictName(s.verdict),
+              confidence: s.confidence,
+              reasoning_cid: s.reasoningCID,
+              timestamp: s.timestamp.toString(),
+            };
+          }
+        }
+
+        const details = {
+          ...toListed(startup_id, info),
+          claimed_collateral: claimed.toString(),
+          committed_collateral,
+          investor_count,
+          token_price_in_stables,
+          adoption_score,
+        };
+
         return {
           content: [
             {
               type: "text" as const,
-              text: JSON.stringify({ error: "Proposal not found", proposal_id }),
+              text: JSON.stringify(serializeBigints(details), null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
+              }),
             },
           ],
           isError: true,
         };
       }
-
-      const collateralRatio = parseFloat(proposal.collateral_ratio);
-      const dailyFees = investment_amount * 0.0005; // ~0.05% daily
-      const breakeven = Math.ceil(
-        (investment_amount * 0.02) / dailyFees,
-      ); // assumes ~2% cost to enter
-
-      const evaluation: EvaluationResult = {
-        proposal_id,
-        investment_amount,
-        estimated_daily_fees_usd: round2(dailyFees),
-        estimated_monthly_fees_usd: round2(dailyFees * 30),
-        pool_volume_24h: round2(investment_amount * 5 + Math.random() * 100000),
-        pool_apy_current: `${(dailyFees / investment_amount * 365 * 100).toFixed(1)}%`,
-        collateral_coverage: proposal.collateral_ratio,
-        risk_score: collateralRatio >= 10 ? "low" : collateralRatio >= 7 ? "medium" : "high",
-        similar_proposals_avg_return: "8.5%",
-        breakeven_days: breakeven,
-      };
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(evaluation, null, 2),
-          },
-        ],
-      };
     },
   );
-}
-
-// --- Helpers ---
-
-function sortProposals(
-  proposals: StartupProposal[],
-  sortBy: string,
-): StartupProposal[] {
-  return [...proposals].sort((a, b) => {
-    switch (sortBy) {
-      case "capital_desc":
-        return b.capital_seeking - a.capital_seeking;
-      case "collateral_ratio_desc":
-        return (
-          parseFloat(b.collateral_ratio) - parseFloat(a.collateral_ratio)
-        );
-      default: // newest
-        return (
-          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-        );
-    }
-  });
-}
-
-function daysUntil(createdAt: string, periodDays: number): number {
-  const deadline = new Date(createdAt).getTime() + periodDays * 86400000;
-  return Math.max(0, Math.ceil((deadline - Date.now()) / 86400000));
-}
-
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
 }

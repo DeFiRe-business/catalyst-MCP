@@ -1,202 +1,270 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { ethers } from "ethers";
 import {
-  registerStartup,
-  getStartupStatus,
-  buybackToken,
-} from "../data-store.js";
-
-const CONNECTED_WALLET = process.env.WALLET_ADDRESS ?? "default";
+  getRegistry,
+  getRegistryAs,
+  getVault,
+  getVaultAs,
+  getHook,
+  getAdoptionScorer,
+  decodeStartup,
+  decodeScore,
+  serializeBigints,
+  statusName,
+  verdictName,
+} from "../blockchain/contracts.js";
 
 export function registerStartupTools(server: McpServer): void {
-  // --- register_startup ---
+  // -------------------------------------------------------------------------
+  // register_startup (write — founder)
+  // -------------------------------------------------------------------------
   server.tool(
     "register_startup",
-    "Register a new startup on DeFiRe Catalyst. Creates TOKEN automatically, deploys Pool 1 and Pool 2, and locks collateral.",
+    `Register a new startup in CatalystRegistry. Sends value=collateral_wei with the call. Requires FOUNDER_PRIVATE_KEY in env. Parses the StartupRegistered event from the receipt to return the assigned startupId.`,
     {
-      name: z.string().describe("Startup name"),
+      name: z.string().min(1).describe("Startup name"),
       description: z.string().describe("Startup description"),
-      capital_seeking: z.number().describe("Total funding sought in USD"),
-      collateral_amount: z.number().describe("Collateral to deposit in USDx"),
-      commitment_period_days: z
+      commitment_period_seconds: z
         .number()
-        .describe("How long investors commit capital"),
-      token_name: z.string().describe("Name for the startup token"),
-      token_symbol: z
+        .int()
+        .positive()
+        .describe("Commitment period in seconds (added to block.timestamp)"),
+      collateral_wei: z.string().describe("Collateral amount in wei (decimal string)"),
+      token_alloc_for_investors: z
         .string()
-        .describe("Symbol for the startup token (3-5 chars)"),
-      token_allocation_investors: z
-        .number()
-        .optional()
-        .describe("Percentage of token supply for investors (e.g., 20)"),
-      min_token_price_target: z
-        .number()
-        .optional()
-        .describe("Minimum token price at evaluation (in USDx)"),
+        .describe("Token allocation reserved for investors (decimal string of uint256)"),
+      min_token_price_wei: z
+        .string()
+        .describe("Minimum TOKEN price required at evaluation, in stablecoin wei"),
     },
-    async (params) => {
-      if (params.collateral_amount <= 0 || params.capital_seeking <= 0) {
+    async ({
+      name,
+      description,
+      commitment_period_seconds,
+      collateral_wei,
+      token_alloc_for_investors,
+      min_token_price_wei,
+    }) => {
+      try {
+        const registry = getRegistryAs("founder");
+        const collateral = BigInt(collateral_wei);
+
+        const tx = await registry.registerStartup(
+          name,
+          description,
+          BigInt(commitment_period_seconds),
+          collateral,
+          BigInt(token_alloc_for_investors),
+          BigInt(min_token_price_wei),
+          { value: collateral },
+        );
+        const receipt = await tx.wait();
+
+        // Parse StartupRegistered to extract assigned startupId.
+        let startupId: string | null = null;
+        let tokenAddress: string | null = null;
+        if (receipt) {
+          const iface = registry.interface;
+          for (const log of receipt.logs) {
+            try {
+              const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+              if (parsed?.name === "StartupRegistered") {
+                startupId = BigInt(parsed.args[0]).toString();
+                tokenAddress = String(parsed.args[3]);
+                break;
+              }
+            } catch {
+              // not our event
+            }
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  startup_id: startupId,
+                  token_address: tokenAddress,
+                  tx_hash: tx.hash,
+                  block_number: receipt?.blockNumber,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify({
-                error: "collateral_amount and capital_seeking must be positive",
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
               }),
             },
           ],
           isError: true,
         };
       }
-
-      const minRatio = 0.05;
-      if (params.collateral_amount / params.capital_seeking < minRatio) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                error: `Collateral ratio too low. Minimum is ${minRatio * 100}%. Provided: ${((params.collateral_amount / params.capital_seeking) * 100).toFixed(2)}%`,
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const result = registerStartup({
-        ...params,
-        owner: CONNECTED_WALLET,
-      });
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
-              {
-                success: true,
-                startup_id: result.startup_id,
-                name: params.name,
-                token_name: params.token_name,
-                token_symbol: params.token_symbol,
-                token_address: result.token_address,
-                pool1_address: result.pool1_address,
-                pool2_address: result.pool2_address,
-                collateral_locked: params.collateral_amount,
-                collateral_ratio:
-                  ((params.collateral_amount / params.capital_seeking) * 100).toFixed(2) + "%",
-                tx_hash: result.tx_hash,
-                message: `Startup "${params.name}" registered. TOKEN ${params.token_symbol} created. Pool 1 & Pool 2 deployed. Collateral locked.`,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
     },
   );
 
-  // --- get_my_startup_status ---
+  // -------------------------------------------------------------------------
+  // deposit_extra_collateral (write — founder)
+  // -------------------------------------------------------------------------
+  server.tool(
+    "deposit_extra_collateral",
+    `Top up an existing startup's collateral via CollateralVault.deposit{value: amount}(jobId). Requires FOUNDER_PRIVATE_KEY (the deposit caller must be the startup owner).`,
+    {
+      startup_id: z.number().int().positive().describe("Startup id"),
+      amount_wei: z.string().describe("Amount to deposit, in wei (decimal string)"),
+    },
+    async ({ startup_id, amount_wei }) => {
+      try {
+        const vault = getVaultAs("founder");
+        const tx = await vault.deposit(BigInt(startup_id), { value: BigInt(amount_wei) });
+        const receipt = await tx.wait();
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  success: true,
+                  startup_id,
+                  amount_wei,
+                  tx_hash: tx.hash,
+                  block_number: receipt?.blockNumber,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // get_my_startup_status (read — founder view)
+  // -------------------------------------------------------------------------
   server.tool(
     "get_my_startup_status",
-    "Get current status: funding progress, fees received, token price, investor count, time remaining.",
+    `Founder-facing status snapshot for one startup: full registry struct + remaining collateral (vault) + investor count (hook) + token price (hook) + adoption score.`,
     {
-      startup_id: z.string().describe("Startup ID"),
+      startup_id: z.number().int().positive().describe("Startup id"),
     },
     async ({ startup_id }) => {
-      const status = getStartupStatus(startup_id);
-      if (!status) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                error: "Startup not found",
-                startup_id,
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
+      try {
+        const registry = getRegistry();
+        const vault = getVault();
+        const hook = getHook();
+        const scorer = getAdoptionScorer();
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(status, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // --- buyback_token ---
-  server.tool(
-    "buyback_token",
-    "Buy back the startup's TOKEN on Pool 2 using USDx. Creates buy pressure and increases token value for investors.",
-    {
-      startup_id: z.string().describe("Startup ID"),
-      amount_usdx: z
-        .number()
-        .describe("Amount of USDx to spend on buyback"),
-      max_slippage_bps: z
-        .number()
-        .default(100)
-        .describe("Max slippage in basis points"),
-    },
-    async ({ startup_id, amount_usdx, max_slippage_bps }) => {
-      if (amount_usdx <= 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({ error: "amount_usdx must be positive" }),
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      const result = buybackToken(startup_id, amount_usdx, max_slippage_bps);
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                error: "Startup not found",
-                startup_id,
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(
+        const raw = await registry.getStartup(startup_id);
+        const info = decodeStartup(raw);
+        if (info.owner === ethers.ZeroAddress) {
+          return {
+            content: [
               {
-                success: true,
-                startup_id,
-                usdx_spent: amount_usdx,
-                tokens_bought: result.tokens_bought,
-                avg_price: result.avg_price,
-                slippage_bps: result.slippage_bps,
-                tx_hash: result.tx_hash,
-                message: `Bought ${result.tokens_bought} tokens at avg price ${result.avg_price} USDx (${result.slippage_bps}bps slippage)`,
+                type: "text" as const,
+                text: JSON.stringify({ error: "Startup not found", startup_id }),
               },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+            ],
+            isError: true,
+          };
+        }
+
+        const [claimedRaw, investorCountRaw, priceRaw, scoreRaw] =
+          await Promise.allSettled([
+            vault.claimedFromJob(startup_id),
+            hook.getInvestorCount(startup_id),
+            hook.getTokenPriceInStables(startup_id),
+            scorer.getScore(startup_id),
+          ]);
+
+        const claimed: bigint =
+          claimedRaw.status === "fulfilled" ? BigInt(claimedRaw.value) : 0n;
+        const remaining_collateral = info.collateral - claimed;
+
+        let adoption_score = null;
+        if (scoreRaw.status === "fulfilled") {
+          const s = decodeScore(scoreRaw.value);
+          if (s.timestamp > 0n) {
+            adoption_score = {
+              verdict: verdictName(s.verdict),
+              confidence: s.confidence,
+              reasoning_cid: s.reasoningCID,
+              timestamp: s.timestamp,
+            };
+          }
+        }
+
+        const out = {
+          startup_id,
+          owner: info.owner,
+          name: info.name,
+          description: info.description,
+          status: statusName(info.status),
+          token: info.token,
+          pool1: info.pool1,
+          pool2: info.pool2,
+          original_collateral: info.collateral,
+          claimed_collateral: claimed,
+          remaining_collateral,
+          commitment_deadline: info.commitmentDeadline,
+          total_funding: info.totalFunding,
+          min_token_price: info.minTokenPrice,
+          investor_count:
+            investorCountRaw.status === "fulfilled" ? Number(investorCountRaw.value) : null,
+          token_price_in_stables:
+            priceRaw.status === "fulfilled" ? BigInt(priceRaw.value) : null,
+          adoption_score,
+        };
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(serializeBigints(out), null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
     },
   );
 }

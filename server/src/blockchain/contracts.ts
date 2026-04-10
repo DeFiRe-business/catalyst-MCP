@@ -1,393 +1,230 @@
-/**
- * On-chain contract interaction layer for DeFiRe Catalyst.
- *
- * Two core contracts:
- *   CatalystRegistry — ERC-8183 based startup registry
- *   CatalystHook     — Uniswap v4 hook that manages investor positions,
- *                       token allocations, fee distribution, and ERC-8210 collateral
- *
- * When env vars are missing the getters return null, and the higher-level
- * code falls back to the in-memory data store.
- */
 import { ethers } from "ethers";
-import { getConfig, getProvider } from "../config.js";
-import type {
-  Proposal,
-  StartupProposal,
-  ProposalStatus,
-} from "../types.js";
+import { getConfig, getProvider, getSigner, type ActorRole } from "../config.js";
 
 // ============================================================================
-// ABI fragments — human-readable Solidity signatures
+// ABI fragments — human-readable Solidity signatures.
+//
+// Read-only views are copied verbatim from
+// `../catalyst/packages/backend/src/abi/`.
+// Write-method signatures are taken directly from the contract sources in
+// `../catalyst/packages/contracts/src/`.
 // ============================================================================
 
-/**
- * CatalystRegistry (extends ERC-8183 Agentic Commerce Protocol)
- *
- * Structs returned from view functions use positional tuples; field order
- * matches the Solidity struct declaration.
- */
 const REGISTRY_ABI = [
-  // ---- Startup track ----
-  "function registerStartup(string name, string description, uint256 capitalSeeking, uint256 collateral, uint256 commitmentPeriodDays, string tokenName, string tokenSymbol, uint256 tokenAllocationInvestorsBps) returns (uint256 jobId)",
-  "function getStartup(uint256 jobId) view returns (tuple(uint256 id, string name, string description, uint8 status, uint256 capitalSeeking, uint256 capitalFunded, uint256 collateral, uint256 commitmentPeriodDays, uint256 tokenAllocationInvestorsBps, address tokenAddress, address pool1, address pool2, address owner, uint256 createdAt))",
-
-  // ---- Shared ----
-  "function jobCount() view returns (uint256)",
-  "function fund(uint256 jobId, uint256 amount, address token) payable",
-  "function withdraw(uint256 jobId, uint256 amount)",
-
-  // ---- ERC-8210 Assurance ----
-  "function getAssuranceAccount(address agent) view returns (tuple(uint256 totalFunded, uint256 availableAmount, uint256 lockedAmount, uint256 paidOutAmount))",
-  "function fileClaim(uint256 jobId, uint256 requestedAmount, bytes evidence) returns (uint256 claimId)",
-
-  // ---- Events ----
-  "event StartupRegistered(uint256 indexed jobId, address indexed owner, string name)",
-  "event JobFunded(uint256 indexed jobId, address indexed investor, uint256 amount)",
-  "event JobCompleted(uint256 indexed jobId)",
-  "event JobFailed(uint256 indexed jobId)",
-  "event ClaimFiled(uint256 indexed jobId, address indexed claimant, uint256 amount)",
+  // Reads
+  "function getStartup(uint256 startupId) view returns (tuple(address owner, string name, string description, address token, address pool1, address pool2, uint256 collateral, uint256 commitmentDeadline, uint256 totalFunding, uint8 status, uint256 minTokenPrice))",
+  "function investorTokenAllocation(uint256) view returns (uint256)",
+  // Writes
+  "function registerStartup(string name, string description, uint256 commitmentPeriod, uint256 collateralAmount, uint256 tokenAllocForInvestors, uint256 minTokenPrice) payable returns (uint256)",
+  "function updateStatus(uint256 id, uint8 newStatus)",
+  "function setPoolAddresses(uint256 startupId, address pool1, address pool2)",
+  // Events
+  "event StartupRegistered(uint256 indexed startupId, address indexed owner, string name, address token)",
+  "event StatusUpdated(uint256 indexed id, uint8 newStatus)",
+  "event PoolAddressesSet(uint256 indexed startupId, address pool1, address pool2)",
 ] as const;
+
+const HOOK_ABI = [
+  "function getInvestors(uint256 jobId) view returns (address[])",
+  "function getInvestorCount(uint256 jobId) view returns (uint256)",
+  "function investorPositions(uint256 jobId, address investor) view returns (uint256)",
+  "function tokenAllocations(uint256 jobId, address investor) view returns (uint256)",
+  "function totalJobLiquidity(uint256 jobId) view returns (uint256)",
+  "function getTokenPriceInStables(uint256 jobId) view returns (uint256)",
+  "event InvestorFunded(address indexed sender, uint256 indexed jobId, uint256 amount)",
+  "event EarlyExit(address indexed sender, uint256 indexed jobId, uint256 tokensForfeited)",
+  "event BuybackTriggered(uint256 indexed jobId, uint256 buybackAmount)",
+  "event FeeDistributed(uint256 indexed jobId, uint256 operationalAmount, address indexed jobOwner)",
+  "event ProtocolFeeCollected(uint256 indexed jobId, uint256 protocolFee, address indexed protocolTreasury)",
+  "event TokensRedistributed(uint256 indexed jobId, uint256 tokensRedistributed, uint256 investorCount)",
+] as const;
+
+const EVALUATOR_ABI = [
+  "function finalReasoningCID(uint256) view returns (bytes32)",
+  "function finalTokenPrice(uint256) view returns (uint256)",
+  "function evaluate(uint256 jobId)",
+  "event JobEvaluated(uint256 indexed jobId, bool success)",
+] as const;
+
+const VAULT_ABI = [
+  "function deposits(uint256) view returns (address owner, uint256 amount, uint256 jobId, bool locked, bool claimed)",
+  "function claims(uint256 jobId, address investor) view returns (uint256 jobId, address claimant, uint256 amount, bytes32 upstream, bytes32 reasoningCID, bytes32 slashEvidenceHash, uint256 timestamp)",
+  "function claimedFromJob(uint256 jobId) view returns (uint256)",
+  "function deposit(uint256 jobId) payable returns (uint256)",
+  "function fileClaim(uint256 jobId, uint256 amount, bytes32 upstream, bytes32 reasoningCID, bytes32 slashEvidenceHash)",
+  "event CollateralDeposited(uint256 indexed depositId, address indexed owner, uint256 amount, uint256 jobId)",
+  "event CollateralReleased(uint256 indexed depositId, address indexed to, uint256 amount)",
+  "event ClaimFiled(uint256 indexed jobId, address indexed investor, uint256 amount, bytes32 upstream, bytes32 reasoningCID, bytes32 slashEvidenceHash)",
+] as const;
+
+const EVAL_REGISTRY_ABI = [
+  "function getEvaluator(address evaluator) view returns (tuple(uint256 stake, bool active, uint256 registeredAt))",
+  "function getSlashRecord(uint256 jobId) view returns (tuple(address evaluator, uint256 jobId, uint256 slashedAmount, bytes32 reason, uint256 timestamp))",
+  "function buildEvidenceHash(uint256 jobId) view returns (bytes32)",
+  "function minStake() view returns (uint256)",
+  "function totalSlashedFunds() view returns (uint256)",
+  "function slashCount() view returns (uint256)",
+  "function registerEvaluator(address evaluator) payable",
+  "function withdraw(address evaluator, uint256 amount)",
+  "function slashEvaluator(address evaluator, uint256 jobId, uint256 slashedAmount, bytes32 reason)",
+  "function setMinStake(uint256 _minStake)",
+  "event EvaluatorRegistered(address indexed evaluator, uint256 stake)",
+  "event EvaluatorStakeIncreased(address indexed evaluator, uint256 added, uint256 newTotal)",
+  "event EvaluatorSlashed(address indexed evaluator, uint256 indexed jobId, uint256 slashedAmount, bytes32 reason)",
+  "event EvaluatorWithdrawn(address indexed evaluator, uint256 amount, uint256 remainingStake)",
+  "event MinStakeUpdated(uint256 oldMinStake, uint256 newMinStake)",
+] as const;
+
+const ADOPTION_SCORER_ABI = [
+  "function getScore(uint256 jobId) view returns (tuple(uint8 verdict, uint8 confidence, bytes32 reasoningCID, uint256 timestamp))",
+  "function oracle() view returns (address)",
+  "function postScore(uint256 jobId, uint8 verdict, uint8 confidence, bytes32 reasoningCID)",
+  "function setOracle(address _oracle)",
+  "event ScorePosted(uint256 indexed jobId, uint8 verdict, uint8 confidence, bytes32 reasoningCID)",
+  "event OracleUpdated(address indexed oldOracle, address indexed newOracle)",
+] as const;
+
+// ============================================================================
+// Read-only contract instances (provider-bound)
+// ============================================================================
+
+export function getRegistry(): ethers.Contract {
+  return new ethers.Contract(getConfig().registryAddress, REGISTRY_ABI, getProvider());
+}
+
+export function getHook(): ethers.Contract {
+  return new ethers.Contract(getConfig().hookAddress, HOOK_ABI, getProvider());
+}
+
+export function getEvaluator(): ethers.Contract {
+  return new ethers.Contract(getConfig().evaluatorAddress, EVALUATOR_ABI, getProvider());
+}
+
+export function getVault(): ethers.Contract {
+  return new ethers.Contract(getConfig().vaultAddress, VAULT_ABI, getProvider());
+}
+
+export function getEvalRegistry(): ethers.Contract {
+  return new ethers.Contract(getConfig().evalRegistryAddress, EVAL_REGISTRY_ABI, getProvider());
+}
+
+export function getAdoptionScorer(): ethers.Contract {
+  return new ethers.Contract(getConfig().adoptionScorerAddress, ADOPTION_SCORER_ABI, getProvider());
+}
+
+// ============================================================================
+// Signer-bound instances (write transactions)
+// ============================================================================
+
+export function getRegistryAs(role: ActorRole): ethers.Contract {
+  return getRegistry().connect(getSigner(role)) as ethers.Contract;
+}
+
+export function getVaultAs(role: ActorRole): ethers.Contract {
+  return getVault().connect(getSigner(role)) as ethers.Contract;
+}
+
+export function getEvaluatorAs(role: ActorRole): ethers.Contract {
+  return getEvaluator().connect(getSigner(role)) as ethers.Contract;
+}
+
+export function getEvalRegistryAs(role: ActorRole): ethers.Contract {
+  return getEvalRegistry().connect(getSigner(role)) as ethers.Contract;
+}
+
+export function getAdoptionScorerAs(role: ActorRole): ethers.Contract {
+  return getAdoptionScorer().connect(getSigner(role)) as ethers.Contract;
+}
+
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+export const STATUS_NAMES = ["funding", "active", "completed", "failed"] as const;
+export type StartupStatusName = (typeof STATUS_NAMES)[number];
+
+export function statusName(raw: number): StartupStatusName {
+  return STATUS_NAMES[raw] ?? "funding";
+}
+
+export const VERDICT_NAMES = ["PENDING", "APPROVE", "DENY"] as const;
+export type VerdictName = (typeof VERDICT_NAMES)[number];
+
+export function verdictName(raw: number): VerdictName {
+  return VERDICT_NAMES[raw] ?? "PENDING";
+}
 
 /**
- * CatalystHook (Uniswap v4 hook — manages investor positions & token allocations)
+ * Recursively serializes any bigint values inside a value to decimal strings,
+ * leaving everything else untouched. Useful for tool responses since JSON
+ * cannot encode bigints natively.
  */
-const HOOK_ABI = [
-  // ---- Investor position tracking ----
-  "function investorPositions(uint256 jobId, address investor) view returns (tuple(uint256 amountInvested, uint256 currentValue, uint256 tokensAllocated, uint256 commitmentDeadline, bool active))",
-  "function tokenAllocations(uint256 jobId, address investor) view returns (uint256 amount)",
-
-  // ---- Aggregated views ----
-  "function totalInvestedInJob(uint256 jobId) view returns (uint256)",
-  "function investorCountForJob(uint256 jobId) view returns (uint256)",
-
-  // ---- Fee distribution ----
-  "function claimFees(uint256 jobId) returns (uint256 amount)",
-  "function accruedFees(uint256 jobId) view returns (uint256)",
-
-  // ---- Token buyback helper ----
-  "function buybackToken(uint256 jobId, uint256 amountUsdx, uint256 maxSlippageBps) returns (uint256 tokensBought)",
-
-  // ---- Events ----
-  "event PositionUpdated(uint256 indexed jobId, address indexed investor, uint256 amount)",
-  "event TokensAllocated(uint256 indexed jobId, address indexed investor, uint256 tokens)",
-  "event FeesDistributed(uint256 indexed jobId, uint256 amount)",
-  "event BuybackExecuted(uint256 indexed jobId, uint256 usdxSpent, uint256 tokensBought)",
-] as const;
-
-// ============================================================================
-// Contract instance singletons
-// ============================================================================
-
-let registry: ethers.Contract | null = null;
-let hook: ethers.Contract | null = null;
-
-export function getRegistry(): ethers.Contract | null {
-  const { registryAddress } = getConfig();
-  if (!registryAddress) return null;
-  if (!registry) {
-    registry = new ethers.Contract(registryAddress, REGISTRY_ABI, getProvider());
+export function serializeBigints<T>(value: T): T {
+  if (typeof value === "bigint") {
+    return value.toString() as unknown as T;
   }
-  return registry;
-}
-
-export function getHook(): ethers.Contract | null {
-  const { hookAddress } = getConfig();
-  if (!hookAddress) return null;
-  if (!hook) {
-    hook = new ethers.Contract(hookAddress, HOOK_ABI, getProvider());
+  if (Array.isArray(value)) {
+    return value.map((v) => serializeBigints(v)) as unknown as T;
   }
-  return hook;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = serializeBigints(v);
+    }
+    return out as T;
+  }
+  return value;
 }
 
-/** Registry connected to a signer — needed for write transactions. */
-export function getSignedRegistry(signer: ethers.Signer): ethers.Contract | null {
-  const { registryAddress } = getConfig();
-  if (!registryAddress) return null;
-  return new ethers.Contract(registryAddress, REGISTRY_ABI, signer);
-}
-
-/** Hook connected to a signer — needed for write transactions. */
-export function getSignedHook(signer: ethers.Signer): ethers.Contract | null {
-  const { hookAddress } = getConfig();
-  if (!hookAddress) return null;
-  return new ethers.Contract(hookAddress, HOOK_ABI, signer);
-}
-
-// ============================================================================
-// On-chain read helpers — return typed data or null when unconfigured
-// ============================================================================
-
-/** Status enum mapping from uint8 on-chain → our string type. */
-const JOB_STATUS_MAP: Record<number, string> = {
-  0: "funding",   // Open
-  1: "funding",   // Funded (still accepting capital)
-  2: "active",    // Submitted / in progress
-  3: "completed", // Completed
-  4: "failed",    // Rejected / Failed
-  5: "failed",    // Expired
-};
-
-function mapStatus(raw: number): string {
-  return JOB_STATUS_MAP[raw] ?? "funding";
-}
-
-// ---------------------------------------------------------------------------
-// CatalystRegistry reads
-// ---------------------------------------------------------------------------
-
-export interface ChainStartup {
-  id: bigint;
+/**
+ * Decodes a `getStartup(id)` tuple into a typed object with bigints intact.
+ * The tuple order matches `ICatalystRegistry.StartupInfo`.
+ */
+export interface StartupInfo {
+  owner: string;
   name: string;
   description: string;
-  status: string;
-  capitalSeeking: bigint;
-  capitalFunded: bigint;
-  collateral: bigint;
-  commitmentPeriodDays: bigint;
-  tokenAllocationInvestorsBps: bigint;
-  tokenAddress: string;
+  token: string;
   pool1: string;
   pool2: string;
-  owner: string;
-  createdAt: bigint;
-}
-
-/**
- * Read a startup record directly from the CatalystRegistry contract.
- * Returns null when on-chain config is missing or the call reverts.
- */
-export async function getStartupFromChain(
-  jobId: number | bigint,
-): Promise<ChainStartup | null> {
-  const reg = getRegistry();
-  if (!reg) return null;
-
-  try {
-    const raw = await reg.getStartup(jobId);
-    return {
-      id: raw[0],
-      name: raw[1],
-      description: raw[2],
-      status: mapStatus(Number(raw[3])),
-      capitalSeeking: raw[4],
-      capitalFunded: raw[5],
-      collateral: raw[6],
-      commitmentPeriodDays: raw[7],
-      tokenAllocationInvestorsBps: raw[8],
-      tokenAddress: raw[9],
-      pool1: raw[10],
-      pool2: raw[11],
-      owner: raw[12],
-      createdAt: raw[13],
-    };
-  } catch (err) {
-    console.error(`[contracts] getStartupFromChain(${jobId}) failed:`, err);
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// CatalystHook reads
-// ---------------------------------------------------------------------------
-
-export interface ChainInvestorPosition {
-  amountInvested: bigint;
-  currentValue: bigint;
-  tokensAllocated: bigint;
+  collateral: bigint;
   commitmentDeadline: bigint;
-  active: boolean;
+  totalFunding: bigint;
+  status: number;
+  minTokenPrice: bigint;
 }
 
-/**
- * Read a single investor's position for a given job from the CatalystHook.
- */
-export async function getInvestorPosition(
-  jobId: number | bigint,
-  investor: string,
-): Promise<ChainInvestorPosition | null> {
-  const h = getHook();
-  if (!h) return null;
-
-  try {
-    const raw = await h.investorPositions(jobId, investor);
-    return {
-      amountInvested: raw[0],
-      currentValue: raw[1],
-      tokensAllocated: raw[2],
-      commitmentDeadline: raw[3],
-      active: raw[4],
-    };
-  } catch (err) {
-    console.error(`[contracts] getInvestorPosition(${jobId}, ${investor}) failed:`, err);
-    return null;
-  }
-}
-
-/**
- * Read the token allocation for a specific investor in a given job.
- */
-export async function getTokenAllocation(
-  jobId: number | bigint,
-  investor: string,
-): Promise<bigint | null> {
-  const h = getHook();
-  if (!h) return null;
-
-  try {
-    return await h.tokenAllocations(jobId, investor);
-  } catch (err) {
-    console.error(`[contracts] getTokenAllocation(${jobId}, ${investor}) failed:`, err);
-    return null;
-  }
-}
-
-/**
- * Read the total amount invested in a job.
- */
-export async function getTotalInvestedInJob(
-  jobId: number | bigint,
-): Promise<bigint | null> {
-  const h = getHook();
-  if (!h) return null;
-
-  try {
-    return await h.totalInvestedInJob(jobId);
-  } catch (err) {
-    console.error(`[contracts] getTotalInvestedInJob(${jobId}) failed:`, err);
-    return null;
-  }
-}
-
-/**
- * Read how many investors have funded a job.
- */
-export async function getInvestorCountForJob(
-  jobId: number | bigint,
-): Promise<number | null> {
-  const h = getHook();
-  if (!h) return null;
-
-  try {
-    const count = await h.investorCountForJob(jobId);
-    return Number(count);
-  } catch (err) {
-    console.error(`[contracts] getInvestorCountForJob(${jobId}) failed:`, err);
-    return null;
-  }
-}
-
-/**
- * Read accrued (unclaimed) fees for a job.
- */
-export async function getAccruedFees(
-  jobId: number | bigint,
-): Promise<bigint | null> {
-  const h = getHook();
-  if (!h) return null;
-
-  try {
-    return await h.accruedFees(jobId);
-  } catch (err) {
-    console.error(`[contracts] getAccruedFees(${jobId}) failed:`, err);
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// ERC-8210 Assurance Account reads
-// ---------------------------------------------------------------------------
-
-export interface AssuranceAccount {
-  totalFunded: bigint;
-  availableAmount: bigint;
-  lockedAmount: bigint;
-  paidOutAmount: bigint;
-}
-
-/**
- * Read the ERC-8210 assurance account for a startup.
- */
-export async function getAssuranceAccount(
-  agent: string,
-): Promise<AssuranceAccount | null> {
-  const reg = getRegistry();
-  if (!reg) return null;
-
-  try {
-    const raw = await reg.getAssuranceAccount(agent);
-    return {
-      totalFunded: raw[0],
-      availableAmount: raw[1],
-      lockedAmount: raw[2],
-      paidOutAmount: raw[3],
-    };
-  } catch (err) {
-    console.error(`[contracts] getAssuranceAccount(${agent}) failed:`, err);
-    return null;
-  }
-}
-
-// ============================================================================
-// Chain → Proposal converter  (used by tool layers for on-chain fallback)
-// ============================================================================
-
-const USDX_DECIMALS = 6;
-
-function fromChainAmount(value: bigint): number {
-  return Number(value) / 10 ** USDX_DECIMALS;
-}
-
-function extractJobId(proposalId: string): number | null {
-  const match = proposalId.match(/^prop_(\d+)$/);
-  return match ? parseInt(match[1], 10) : null;
-}
-
-function chainStartupToProposal(
-  chain: ChainStartup,
-  proposalId: string,
-): StartupProposal {
-  const capitalSeeking = fromChainAmount(chain.capitalSeeking);
-  const capitalFunded = fromChainAmount(chain.capitalFunded);
-  const collateral = fromChainAmount(chain.collateral);
-
+export function decodeStartup(raw: ethers.Result | StartupInfo): StartupInfo {
+  // ethers v6 returns tuple results as Result with both indexed and named access.
+  const r = raw as unknown as Record<string | number, unknown>;
   return {
-    id: proposalId,
-    track: "startup",
-    name: chain.name,
-    description: chain.description,
-    status: chain.status as ProposalStatus,
-    capital_seeking: capitalSeeking,
-    capital_funded: capitalFunded,
-    collateral,
-    collateral_ratio:
-      capitalSeeking > 0
-        ? ((collateral / capitalSeeking) * 100).toFixed(2) + "%"
-        : "0%",
-    commitment_period_days: Number(chain.commitmentPeriodDays),
-    token_allocation_investors:
-      (Number(chain.tokenAllocationInvestorsBps) / 100).toFixed(0) + "%",
-    token_address: chain.tokenAddress,
-    pool1_address: chain.pool1,
-    pool2_address: chain.pool2,
-    owner: chain.owner,
-    created_at: new Date(Number(chain.createdAt) * 1000).toISOString(),
+    owner: String(r.owner ?? r[0]),
+    name: String(r.name ?? r[1]),
+    description: String(r.description ?? r[2]),
+    token: String(r.token ?? r[3]),
+    pool1: String(r.pool1 ?? r[4]),
+    pool2: String(r.pool2 ?? r[5]),
+    collateral: BigInt((r.collateral ?? r[6]) as bigint | string | number),
+    commitmentDeadline: BigInt((r.commitmentDeadline ?? r[7]) as bigint | string | number),
+    totalFunding: BigInt((r.totalFunding ?? r[8]) as bigint | string | number),
+    status: Number(r.status ?? r[9]),
+    minTokenPrice: BigInt((r.minTokenPrice ?? r[10]) as bigint | string | number),
   };
 }
 
-/**
- * Try to resolve a proposal from on-chain data.
- * Returns undefined when contracts are not configured or the job doesn't exist.
- * Callers should fall back to the in-memory data-store when this returns undefined.
- */
-export async function resolveProposalFromChain(
-  proposalId: string,
-): Promise<Proposal | undefined> {
-  const jobId = extractJobId(proposalId);
-  if (jobId === null) return undefined;
+export interface ScoreInfo {
+  verdict: number;
+  confidence: number;
+  reasoningCID: string;
+  timestamp: bigint;
+}
 
-  const startup = await getStartupFromChain(jobId);
-  if (startup) return chainStartupToProposal(startup, proposalId);
-
-  return undefined;
+export function decodeScore(raw: ethers.Result | ScoreInfo): ScoreInfo {
+  const r = raw as unknown as Record<string | number, unknown>;
+  return {
+    verdict: Number(r.verdict ?? r[0]),
+    confidence: Number(r.confidence ?? r[1]),
+    reasoningCID: String(r.reasoningCID ?? r[2]),
+    timestamp: BigInt((r.timestamp ?? r[3]) as bigint | string | number),
+  };
 }
